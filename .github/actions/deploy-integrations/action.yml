@@ -1,0 +1,58 @@
+name: Deploy Integrations
+description: Deploys integrations
+
+inputs:
+  environment:
+    type: choice
+    description: 'Environment to deploy to'
+    required: true
+    options:
+      - staging
+      - production
+  extra_filter:
+    type: string
+    description: 'Pnpm additional filters to select integrations to deploy'
+    required: false
+    default: ''
+  force:
+    type: boolean
+    description: 'Force re-deploying integrations'
+    default: false
+    required: false
+  dry_run:
+    type: boolean
+    description: 'Ask the backend to perform validation without actually deploying'
+    default: false
+    required: true
+  token_cloud_ops_account:
+    description: 'Cloud Ops account token'
+    required: true
+  cloud_ops_workspace_id:
+    description: 'Cloud Ops workspace id'
+    required: true
+  shopify_admin_automation_token:
+    description: 'Shopify app automation token for the Shopify Admin app (app-scoped, env-specific)'
+    required: true
+    default: ''
+  shopify_storefront_automation_token:
+    description: 'Shopify app automation token for the Shopify Storefront app (app-scoped, env-specific)'
+    required: true
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Deploys Integrations
+      env:
+        INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        INPUT_FORCE: ${{ inputs.force }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        INPUT_EXTRA_FILTER: ${{ inputs.extra_filter }}
+        GH_TOKEN: ${{ github.token }}
+        TOKEN_CLOUD_OPS_ACCOUNT: ${{ inputs.token_cloud_ops_account }}
+        CLOUD_OPS_WORKSPACE_ID: ${{ inputs.cloud_ops_workspace_id }}
+        SHOPIFY_ADMIN_AUTOMATION_TOKEN: ${{ inputs.shopify_admin_automation_token }}
+        SHOPIFY_STOREFRONT_AUTOMATION_TOKEN: ${{ inputs.shopify_storefront_automation_token }}
+        COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+      shell: bash
+      run: bash ./.github/scripts/deploy-integrations.sh

@@ -1,0 +1,12 @@
+{
+  "[typescript]": {
+    "editor.defaultFormatter": "oxc.oxc-vscode"
+  },
+  "[json]": {
+    "editor.defaultFormatter": "oxc.oxc-vscode"
+  },
+  "editor.tabSize": 3,
+  "git.branchProtection": ["master"],
+  "vitest.disableWorkspaceWarning": false,
+  "js/ts.tsdk.path": "node_modules/typescript-editor/lib"
+}

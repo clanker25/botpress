@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "strict": false
+  },
+  "exclude": ["node_modules", "dist"],
+  "include": ["src/**/*", "e2e/**/*", "*.ts"]
+}

@@ -1,0 +1,249 @@
+import * as dynamodb from '@aws-sdk/client-dynamodb'
+import { mapBotpressMessageToChat } from './api/message-payload'
+import { makeApiUtils } from './api-utils'
+import { AuthKeyHandler } from './auth-key'
+import { emitBotMessageSignals } from './bot-message-signals'
+import * as debug from './debug'
+import { makeHandler } from './handler'
+import { MemorySpace, ChatIdStore, InMemoryChatIdStore, DynamoDbChatIdStore } from './id-store'
+import { bareLogger } from './logger'
+import { emitMessageStream } from './message-stream'
+import { startMetricsServer } from './metrics-server'
+import { Options, options } from './options'
+import { CompositeSignalEmiter, PushpinEmitter, SignalEmitter, WebhookEmitter } from './signal-emitter'
+import { initTracing, normalizePath, runWithSpan, setSpanAttributes, SPAN_ATTRS } from './tracing'
+import { MessageArgs, ActionArgs } from './types'
+import * as bp from '.botpress'
+
+const tracingProvider = initTracing()
+if (tracingProvider) {
+  process.on(
+    'SIGTERM',
+    () =>
+      void tracingProvider
+        .shutdown()
+        .catch((thrown: unknown) => bareLogger.error('Failed to shut down tracing provider', thrown))
+  )
+}
+
+const memSpace = new MemorySpace()
+
+type ChatIdStores = Record<'convIdStore' | 'userIdStore', ChatIdStore>
+const makeIdStores = (options: Options, logger: bp.Logger): ChatIdStores => {
+  if (options.fidStore.strategy === 'dynamo-db') {
+    const { botId } = options
+    const { endpoint, region, accessKeyId, secretAccessKey, conversationTable, userTable } = options.fidStore
+
+    const client = new dynamodb.DynamoDBClient({
+      endpoint,
+      region,
+      credentials: {
+        accessKeyId,
+        secretAccessKey,
+      },
+    })
+
+    return {
+      convIdStore: new DynamoDbChatIdStore(client, { botId, ...conversationTable }, logger),
+      userIdStore: new DynamoDbChatIdStore(client, { botId, ...userTable }, logger),
+    }
+  }
+
+  return {
+    convIdStore: new InMemoryChatIdStore(logger, memSpace.subSpace('conversation')),
+    userIdStore: new InMemoryChatIdStore(logger, memSpace.subSpace('user')),
+  }
+}
+
+const makeEmitter = (options: Options, logger: bp.Logger): SignalEmitter => {
+  const { signalUrl, signalSecret, webhookUrl, webhookSecret } = options
+
+  const pushpinEmitter = new PushpinEmitter(signalUrl, signalSecret, logger)
+  if (!webhookUrl) {
+    return pushpinEmitter
+  }
+
+  const webhookEmitter = new WebhookEmitter(webhookUrl, webhookSecret, logger)
+  return new CompositeSignalEmiter([pushpinEmitter, webhookEmitter])
+}
+
+const mapMessageSignalFid = async (idStores: ChatIdStores, args: MessageArgs): Promise<MessageArgs> => {
+  const conversationId = await idStores.convIdStore.byId.get(args.conversation.id)
+  const userId = await idStores.userIdStore.byId.get(args.user.id)
+  return {
+    ...args,
+    message: {
+      ...args.message,
+      conversationId,
+      userId,
+    },
+    conversation: {
+      ...args.conversation,
+      id: conversationId,
+    },
+    user: {
+      ...args.user,
+      id: userId,
+    },
+  }
+}
+
+const mapEventSignalFid = async (
+  idStores: ChatIdStores,
+  args: ActionArgs<'sendEvent'>
+): Promise<ActionArgs<'sendEvent'>> => {
+  const { input } = args
+  const conversationId = await idStores.convIdStore.byId.get(input.conversationId)
+  return {
+    ...args,
+    input: {
+      ...input,
+      conversationId,
+    },
+  }
+}
+
+const emitMessage = async (args: MessageArgs) => {
+  await runWithSpan('emit.message', async () => {
+    const opts = options(args)
+    const signalEmitter = makeEmitter(opts, args.logger)
+    const idStores = makeIdStores(opts, args.logger)
+
+    const {
+      conversation: { id: channel },
+    } = args
+
+    args = await mapMessageSignalFid(idStores, args)
+    debug.debugSignal(args.logger, args)
+
+    setSpanAttributes({
+      [SPAN_ATTRS.CONVERSATION_ID]: args.conversation.id,
+      [SPAN_ATTRS.USER_ID]: args.user.id,
+      [SPAN_ATTRS.MESSAGE_ID]: args.message.id,
+    })
+
+    const { metadata, payload } = mapBotpressMessageToChat(args)
+    await emitBotMessageSignals({
+      channel,
+      signalEmitter,
+      message: {
+        id: args.message.id,
+        conversationId: args.conversation.id,
+        userId: args.user.id,
+        createdAt: args.message.createdAt,
+        payload,
+        metadata,
+      },
+    })
+  })
+}
+
+const emitEvent = async (args: ActionArgs<'sendEvent'>) => {
+  await runWithSpan('emit.event', async () => {
+    const opts = options(args)
+    const signalEmitter = makeEmitter(opts, args.logger)
+    const idStores = makeIdStores(opts, args.logger)
+
+    const {
+      input: { conversationId: channel },
+    } = args
+
+    args = await mapEventSignalFid(idStores, args)
+    debug.debugSignal(args.logger, args)
+
+    setSpanAttributes({
+      [SPAN_ATTRS.CONVERSATION_ID]: args.input.conversationId,
+    })
+
+    await signalEmitter.emit(channel, {
+      type: 'event_created',
+      data: {
+        id: null,
+        createdAt: new Date().toISOString(),
+        conversationId: args.input.conversationId,
+        userId: args.ctx.botUserId,
+        payload: args.input.payload,
+        isBot: true,
+      },
+    })
+  })
+}
+
+class IntegrationWithMetrics extends bp.Integration {
+  public startMetricsServer = startMetricsServer
+}
+
+export default new IntegrationWithMetrics({
+  register: async () => {},
+  unregister: async () => {},
+  __advanced: {
+    managesOwnTracePropagation: !!tracingProvider,
+  },
+  actions: {
+    publishMessageStream: async (props) => {
+      await runWithSpan('emit.message_stream', async () => {
+        const opts = options(props)
+        const signalEmitter = makeEmitter(opts, props.logger)
+        const idStores = makeIdStores(opts, props.logger)
+        await emitMessageStream(props, { ...idStores, signalEmitter })
+      })
+      return {}
+    },
+    sendEvent: async (props) => {
+      await emitEvent(props)
+      return {}
+    },
+  },
+  channels: {
+    channel: {
+      messages: {
+        text: emitMessage,
+        markdown: emitMessage,
+        image: emitMessage,
+        audio: emitMessage,
+        video: emitMessage,
+        file: emitMessage,
+        location: emitMessage,
+        carousel: emitMessage,
+        card: emitMessage,
+        dropdown: emitMessage,
+        choice: emitMessage,
+        bloc: emitMessage,
+      },
+    },
+  },
+  handler: async (props) => {
+    const opts = options(props)
+
+    const signalEmitter = makeEmitter(opts, props.logger)
+    const auth = new AuthKeyHandler(opts.encryptionKey, opts.encryptionMode)
+    const apiUtils = makeApiUtils(props.client)
+    const idStores = makeIdStores(opts, props.logger)
+
+    const handler = makeHandler({
+      ...idStores,
+      signals: signalEmitter,
+      auth,
+      apiUtils,
+    })
+
+    const reqId = debug.debugRequest(props.logger, props.req)
+    const res = await runWithSpan(
+      `${props.req.method} ${normalizePath(props.req.path)}`,
+      async () => {
+        setSpanAttributes({
+          [SPAN_ATTRS.BOT_ID]: props.ctx.botId,
+          [SPAN_ATTRS.INTEGRATION_ID]: props.ctx.integrationId,
+        })
+        return handler(props)
+      },
+      {
+        // traceHeaders is only used for W3C context extraction — header values are not stored as span attributes
+        traceHeaders: props.req.headers,
+      }
+    )
+    debug.debugResponse(props.logger, reqId, res)
+
+    return res
+  },
+})

