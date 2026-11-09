@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "esModuleInterop": true,
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "target": "ES2017",
+    "strict": true,
+    "jsx": "preserve",
+    "noUnusedLocals": false,
+    "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": false,
+    "allowSyntheticDefaultImports": true,
+    "lib": ["dom", "ESNext", "dom.iterable"],
+    "allowJs": false,
+    "declaration": false,
+    "skipLibCheck": false,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": false,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noErrorTruncation": true
+  },
+  "exclude": ["node_modules", "dist", "vitest.config.ts"],
+  "include": ["src/**/*", "bench/**/*", "*.ts"],
+  "ts-node": {
+    "esm": false
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "@bp-templates/empty-plugin",
+  "pluginName": "empty-plugin",
+  "scripts": {
+    "check:type": "tsc --noEmit"
+  },
+  "private": false,
+  "dependencies": {
+    "@botpress/sdk": "7.2.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.16.4",
+    "typescript": "^6.0.0"
+  }
+}
