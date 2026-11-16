@@ -1,0 +1,160 @@
+import { createHmac } from 'crypto'
+import { beforeAll, describe, expect, it, vi } from 'vitest'
+import { fireOrderCreated } from './events/order-created'
+import { handler } from './handler'
+
+const SECRET = 'test-shopify-secret'
+
+beforeAll(() => {
+  process.env.SECRET_SHOPIFY_CLIENT_ID = 'test-client-id'
+  process.env.SECRET_SHOPIFY_CLIENT_SECRET = SECRET
+})
+
+vi.mock('./events/order-created', () => ({ fireOrderCreated: vi.fn(async () => ({ status: 200, body: 'ok' })) }))
+vi.mock('./events/order-updated', () => ({ fireOrderUpdated: vi.fn(async () => ({ status: 200, body: 'ok' })) }))
+vi.mock('./events/order-cancelled', () => ({ fireOrderCancelled: vi.fn(async () => ({ status: 200, body: 'ok' })) }))
+vi.mock('./events/order-fulfilled', () => ({ fireOrderFulfilled: vi.fn(async () => ({ status: 200, body: 'ok' })) }))
+vi.mock('./events/order-paid', () => ({ fireOrderPaid: vi.fn(async () => ({ status: 200, body: 'ok' })) }))
+
+const computeHmac = (body: string, secret = SECRET) =>
+  createHmac('sha256', secret).update(body, 'utf8').digest('base64')
+
+const buildProps = (opts: {
+  topic?: string
+  hmac?: string
+  body?: string
+  path?: string
+  credentials?: Record<string, unknown>
+  getStateError?: unknown
+}) => {
+  const body = opts.body ?? '{}'
+  const headers: Record<string, string> = {}
+  if (opts.topic !== undefined) headers['x-shopify-topic'] = opts.topic
+  if (opts.hmac !== undefined) headers['x-shopify-hmac-sha256'] = opts.hmac
+  const noop = () => {}
+  const forBot = () => ({ info: noop, warn: noop, error: noop, debug: noop })
+  return {
+    req: { path: opts.path ?? '/', headers, body },
+    ctx: { integrationId: 'int-1' },
+    client: {
+      getState:
+        opts.getStateError !== undefined
+          ? vi.fn().mockRejectedValue(opts.getStateError)
+          : vi.fn().mockResolvedValue({ state: { payload: opts.credentials ?? {} } }),
+    },
+    logger: { forBot },
+  } as any
+}
+
+describe('Shopify webhook handler', () => {
+  const validBody = '{"shop_id":1,"shop_domain":"x.myshopify.com"}'
+
+  describe('GDPR compliance topics', () => {
+    const topics = ['customers/data_request', 'customers/redact', 'shop/redact']
+
+    for (const topic of topics) {
+      it(`returns 200 on valid HMAC for ${topic}`, async () => {
+        const response = await handler(buildProps({ topic, hmac: computeHmac(validBody), body: validBody }))
+        expect(response).toEqual({ status: 200, body: '' })
+      })
+
+      it(`returns 401 on invalid HMAC for ${topic}`, async () => {
+        const response = await handler(buildProps({ topic, hmac: 'invalid-hmac', body: validBody }))
+        expect(response).toMatchObject({ status: 401 })
+      })
+    }
+  })
+
+  describe('request validation', () => {
+    it('returns 400 when topic header is missing', async () => {
+      const response = await handler(buildProps({ hmac: computeHmac(validBody), body: validBody }))
+      expect(response).toMatchObject({ status: 400 })
+    })
+
+    it('returns 400 when hmac header is missing', async () => {
+      const response = await handler(buildProps({ topic: 'customers/redact', body: validBody }))
+      expect(response).toMatchObject({ status: 400 })
+    })
+  })
+
+  it('returns 200 on unknown topic after HMAC passes', async () => {
+    const response = await handler(
+      buildProps({ topic: 'products/create', hmac: computeHmac(validBody), body: validBody })
+    )
+    expect(response).toEqual({ status: 200, body: '' })
+  })
+
+  // Shopify retries non-2xx responses and disables the webhook after repeated failures, so a
+  // malformed payload or a transient event-dispatch error must never escalate into a 4xx/5xx.
+  describe('error handling returns 200 to avoid Shopify retry loops', () => {
+    it('returns 200 on malformed JSON body after HMAC passes', async () => {
+      const malformed = '{not-json'
+      const response = await handler(
+        buildProps({ topic: 'orders/create', hmac: computeHmac(malformed), body: malformed })
+      )
+      expect(response).toEqual({ status: 200, body: '' })
+    })
+
+    it('returns 200 when an event handler throws', async () => {
+      vi.mocked(fireOrderCreated).mockRejectedValueOnce(new Error('createEvent failed'))
+      const response = await handler(
+        buildProps({ topic: 'orders/create', hmac: computeHmac(validBody), body: validBody })
+      )
+      expect(response).toEqual({ status: 200, body: '' })
+    })
+  })
+
+  describe('manual setup', () => {
+    const MERCHANT_SECRET = 'merchant-app-secret'
+    const credentials = {
+      authMethod: 'manual',
+      shopDomain: 'example',
+      clientId: 'my-id',
+      clientSecret: MERCHANT_SECRET,
+    }
+
+    it("accepts webhooks signed with the merchant app's client secret", async () => {
+      const response = await handler(
+        buildProps({
+          topic: 'orders/create',
+          hmac: computeHmac(validBody, MERCHANT_SECRET),
+          body: validBody,
+          credentials,
+        })
+      )
+      expect(response).toMatchObject({ status: 200 })
+      expect(fireOrderCreated).toHaveBeenCalled()
+    })
+
+    it("rejects webhooks signed with Botpress's own app secret", async () => {
+      const response = await handler(
+        buildProps({ topic: 'orders/create', hmac: computeHmac(validBody), body: validBody, credentials })
+      )
+      expect(response).toMatchObject({ status: 401 })
+    })
+  })
+
+  describe('credentials state read', () => {
+    it('returns 503 without firing the event when the state read fails unexpectedly', async () => {
+      vi.mocked(fireOrderCreated).mockClear()
+      const response = await handler(
+        buildProps({
+          topic: 'orders/create',
+          hmac: computeHmac(validBody, 'merchant-app-secret'),
+          body: validBody,
+          getStateError: new Error('state service unavailable'),
+        })
+      )
+      expect(response).toMatchObject({ status: 503 })
+      expect(fireOrderCreated).not.toHaveBeenCalled()
+    })
+
+    it('falls back to the Botpress app secret when no credentials state exists', async () => {
+      const notFound = { isApiError: true, type: 'ResourceNotFound', message: 'not found' }
+      const response = await handler(
+        buildProps({ topic: 'orders/create', hmac: computeHmac(validBody), body: validBody, getStateError: notFound })
+      )
+      expect(response).toMatchObject({ status: 200 })
+    })
+  })
+})
