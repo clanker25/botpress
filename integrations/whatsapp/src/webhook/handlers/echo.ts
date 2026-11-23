@@ -1,0 +1,87 @@
+import { safeFormatPhoneNumber } from '../../misc/phone-number-to-whatsapp'
+import { WhatsAppMessageEchoValue, WhatsAppEchoMessage } from '../../misc/types'
+import { _handleMessage } from './messages'
+import * as bp from '.botpress'
+
+export const echoHandler = async (
+  echo: WhatsAppEchoMessage,
+  value: WhatsAppMessageEchoValue,
+  props: bp.HandlerProps
+) => {
+  const { ctx, client, logger } = props
+
+  const formatPhoneNumberResponse = safeFormatPhoneNumber(echo.to)
+  if (formatPhoneNumberResponse.success === false) {
+    logger
+      .forBot()
+      .error(`Failed to parse recipient phone number "${echo.to}": ${formatPhoneNumberResponse.error.message}`)
+  }
+  const userPhone = formatPhoneNumberResponse.success ? formatPhoneNumberResponse.phoneNumber : echo.to
+
+  const { conversation } = await client.getOrCreateConversation({
+    channel: 'channel',
+    tags: {
+      userPhone,
+      botPhoneNumberId: value.metadata.phone_number_id,
+    },
+  })
+
+  const { user } = await client.getOrCreateUser({
+    tags: { number: echo.from },
+    name: echo.from,
+    discriminateByTags: ['number'],
+  })
+
+  // `message_creation_type` is absent from Meta's real echo payloads, so only tag it when present.
+  const messageTags = {
+    id: echo.id,
+    ...(echo.message_creation_type ? { echoCreationType: echo.message_creation_type } : {}),
+  }
+
+  const newMessage = await _handleMessage({
+    message: echo,
+    conversationId: conversation.id,
+    userId: user.id,
+    ctx,
+    client,
+    logger,
+    tags: messageTags,
+    createMessageOverride: async ({ type, payload, caption }) => {
+      const importedMessage =
+        caption && (type === 'image' || type === 'video' || type === 'file')
+          ? {
+              type: 'bloc' as const,
+              payload: {
+                items: [
+                  { type, payload } as bp.channels.channel.Messages['bloc']['items'][number],
+                  { type: 'text' as const, payload: { text: caption } },
+                ],
+              },
+            }
+          : { type, payload }
+
+      const { messages } = await client._inner.importMessages({
+        messages: [
+          {
+            ...importedMessage,
+            userId: user.id,
+            conversationId: conversation.id,
+            tags: messageTags,
+            createdAt: new Date(parseInt(echo.timestamp) * 1000).toISOString(),
+            discriminateByTags: ['id'],
+          },
+        ],
+      })
+      return messages[0] ? { message: messages[0] } : undefined
+    },
+  })
+
+  if (newMessage) {
+    await client.createEvent({
+      type: 'onMessageEchoReceived',
+      conversationId: conversation.id,
+      messageId: newMessage.message.id,
+      payload: {},
+    })
+  }
+}

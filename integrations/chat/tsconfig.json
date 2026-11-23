@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "paths": { "*": ["./*"] },
+    "noErrorTruncation": true
+  },
+  "include": [".botpress/**/*", "definitions/**/*", "src/**/*", "*.ts"],
+  "exclude": ["vitest.config.ts"]
+}

@@ -1,0 +1,47 @@
+import { default as sdk, z } from '@botpress/sdk'
+
+export const configuration = {
+  schema: z.object({
+    calendarId: z
+      .string()
+      .title('Calendar ID')
+      .min(1)
+      .describe('The ID of the Google Calendar to interact with. You can find it in your Google Calendar settings.')
+      .optional()
+      .hidden(),
+  }),
+  identifier: { linkTemplateScript: 'linkTemplate.vrl', required: true },
+} as const satisfies sdk.IntegrationDefinitionProps['configuration']
+
+export const identifier = undefined satisfies sdk.IntegrationDefinitionProps['identifier']
+
+export const configurations = {
+  serviceAccountKey: {
+    title: 'Manual configuration',
+    description: 'Configure manually with a Service Account Key',
+    schema: z.object({
+      calendarId: z
+        .string()
+        .title('Calendar ID')
+        .min(1)
+        .describe('The ID of the Google Calendar to interact with. You can find it in your Google Calendar settings.'),
+      privateKey: z
+        .string()
+        .title('Service account private key')
+        .min(1)
+        .describe('The private key from the Google service account. You can get it from the downloaded JSON file.'),
+      clientEmail: z
+        .string()
+        .title('Service account email')
+        .email()
+        .describe('The client email from the Google service account. You can get it from the downloaded JSON file.'),
+      impersonateEmail: z
+        .string()
+        .optional()
+        .title('Impersonate email')
+        .describe(
+          "The email of the user to impersonate. This is the email of the user you want to impersonate. It's mandatory for inviting people or creating meetings."
+        ),
+    }),
+  },
+} as const satisfies sdk.IntegrationDefinitionProps['configurations']

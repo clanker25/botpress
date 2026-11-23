@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "paths": { "*": ["./*"] },
+    "outDir": "dist",
+    "experimentalDecorators": false,
+    "emitDecoratorMetadata": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact"
+  },
+  "include": [".botpress/**/*", "definitions/**/*", "src/**/*", "*.ts"],
+  "exclude": ["vitest.config.ts"]
+}
